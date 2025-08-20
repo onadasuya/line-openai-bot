@@ -1,0 +1,14 @@
+{
+  "name": "line-openai-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^7.5.2",
+    "express": "^4.18.2",
+    "openai": "^4.56.0"
+  }
+}
