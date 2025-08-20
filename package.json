@@ -9,6 +9,8 @@
   "dependencies": {
     "@line/bot-sdk": "^7.5.2",
     "express": "^4.18.2",
-    "openai": "^4.56.0"
+    "openai": "^4.56.0",
+    "googleapis": "^126.0.1"
   }
 }
+
