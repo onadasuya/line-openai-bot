@@ -28,7 +28,7 @@ async function handleEvent(event) {
   const userText = event.message.text;
 
   const systemPrompt =
-    "あなたは優しい悩み相談カウンセラー。否定せず共感→状況確認→小さな提案の順で、200〜300字で返答。医療や法律は断定しない。";
+    "あなたは優しい悩み相談カウンセラー。否定せず共感→状況確認→小さな提案の順で返答。医療や法律は断定しない。";
 
   let reply = "ごめんね、いま上手く返答を作れないみたい。もう一度送ってみてね。";
 
@@ -58,3 +58,4 @@ app.get("/", (_, res) => res.send("LINE × OpenAI bot on Render"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
+
