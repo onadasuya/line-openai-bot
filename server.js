@@ -15,8 +15,9 @@ const {
   USERS_SHEET = "users",       // ユーザー台帳タブ名
   SYSTEM_PROMPT,
   ADMIN_USER_ID,               // あなたのLINE userId（承認通知の送り先）
-  APPROVE_TOKEN,               // 承認URLの簡易トークン（長めのランダム文字列に）
+  APPROVE_TOKEN,               // 承認URLの簡易トークン（長めのランダム文字列）
   BASE_URL,                    // 例: https://line-openai-bot-xxxx.onrender.com
+  BATCH_WINDOW_SECONDS = "60", // まとめ待ち時間（秒）※最後の受信からの待ち
 } = process.env;
 
 // 必須チェック
@@ -59,7 +60,7 @@ const sheets = google.sheets({ version: "v4", auth });
 // ========= Helpers =========
 const systemPrompt =
   SYSTEM_PROMPT ||
-  "あなたは優しい悩み相談カウンセラー。否定せず共感→状況確認→小さな提案の順で200〜300字で返答。医療や法律は断定しない。";
+  "あなたは優しい悩み相談カウンセラー。否定せず共感→状況確認→小さな提案の順で200〜300字で返答。医療や法律は断定しない。タメ口。絵文字は文末1〜2個。";
 
 function nowJST() {
   const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
@@ -164,8 +165,8 @@ async function generateDraft(userText) {
   try {
     const r = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.7,
-      max_tokens: 400,
+      temperature: 0.4, // 安定寄り
+      max_tokens: 500,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userText },
@@ -179,31 +180,36 @@ async function generateDraft(userText) {
   }
 }
 
-// ========= App =========
-const app = express();
+// ========= 連投まとめ用（デバウンス） =========
+const WINDOW_SEC = parseInt(BATCH_WINDOW_SECONDS || "60", 10);
+// { [userId]: { texts: string[], timer: NodeJS.Timeout | null } }
+const buffers = new Map();
 
-// Webhook（承認前は一切返信しない）
-app.post("/callback", middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }), async (req, res) => {
-  try {
-    for (const ev of (req.body.events || [])) {
-      await handleEvent(ev);
-    }
-    res.sendStatus(200);
-  } catch (e) {
-    console.error("webhook error:", e);
-    res.sendStatus(500);
-  }
-});
-
-async function handleEvent(event) {
+async function bufferIncoming(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-
   const userId = event.source?.userId;
   if (!userId) return;
 
-  const userText = event.message.text;
+  const buf = buffers.get(userId) || { texts: [], timer: null };
+  buf.texts.push(event.message.text);
 
-  // 表示名
+  if (buf.timer) clearTimeout(buf.timer);
+
+  buf.timer = setTimeout(async () => {
+    const texts = buf.texts.slice();
+    buffers.delete(userId); // 使い終わったので破棄
+    try {
+      await processBatchedMessages(userId, texts);
+    } catch (e) {
+      console.error("processBatchedMessages error:", e?.message || e);
+    }
+  }, WINDOW_SEC * 1000);
+
+  buffers.set(userId, buf);
+}
+
+async function processBatchedMessages(userId, texts) {
+  // 表示名（台帳更新）
   let displayName = "";
   try {
     const prof = await lineClient.getProfile(userId);
@@ -212,6 +218,9 @@ async function handleEvent(event) {
   } catch (e) {
     console.error("profile error:", e?.message || e);
   }
+
+  // 受信文を結合（見やすい区切り線）
+  const userText = texts.join("\n——\n");
 
   // 下書き作成
   const draft = await generateDraft(userText);
@@ -227,9 +236,9 @@ async function handleEvent(event) {
       await lineClient.pushMessage(ADMIN_USER_ID, {
         type: "text",
         text:
-          `【承認待ち】\n` +
-          `from: ${displayName || "unknown"} (${userId})\n` +
-          `Q: ${userText}\n\n` +
+          `【承認待ち（まとめ ${texts.length} 通）】\n` +
+          `from: ${displayName || "unknown"} (${userId})\n\n` +
+          `Q:\n${userText}\n\n` +
           `Draft:\n${draft}\n\n` +
           `承認/却下 → ${reviewUrl}`,
       });
@@ -238,6 +247,22 @@ async function handleEvent(event) {
     }
   }
 }
+
+// ========= App =========
+const app = express();
+
+// Webhook（承認前は一切返信しない／60秒まとめ）
+app.post("/callback", middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }), async (req, res) => {
+  try {
+    for (const ev of (req.body.events || [])) {
+      await bufferIncoming(ev);
+    }
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("webhook error:", e);
+    res.sendStatus(500);
+  }
+});
 
 // 承認レビューページ
 app.get("/review", async (req, res) => {
@@ -257,7 +282,7 @@ app.get("/review", async (req, res) => {
         <h2>承認レビュー</h2>
         <p><b>Status:</b> ${status}</p>
         <p><b>User:</b> ${escapeHtml(displayName)} (${escapeHtml(userId)})</p>
-        <p><b>Message:</b><br>${escapeHtml(userText).replace(/\n/g, "<br>")}</p>
+        <p><b>Message(合算):</b><br>${escapeHtml(userText).replace(/\n/g, "<br>")}</p>
         <p><b>Draft:</b><br>${escapeHtml(draft).replace(/\n/g, "<br>")}</p>
         <p>
           <a href="${approveUrl}"><button style="padding:8px 16px;">承認して送信</button></a>
@@ -314,7 +339,7 @@ app.get("/reject", async (req, res) => {
 });
 
 // Health
-app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets (manual approval) running"));
+app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets (manual approval + 60s batch) running"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
