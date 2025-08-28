@@ -1,4 +1,4 @@
-import express from "express";
+import express from "express";import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import OpenAI from "openai";
 import { google } from "googleapis";
@@ -15,31 +15,29 @@ const {
   USERS_SHEET = "users",
   SUMMARIES_SHEET = "user_summaries",
   SYSTEM_PROMPT,
-  // 承認フロー（任意）
+  // 手動承認（任意）
   ADMIN_USER_ID,
   APPROVE_TOKEN,
   BASE_URL,
+  // 連投まとめ（秒）
+  BATCH_WINDOW_SECONDS = "60",
 } = process.env;
 
-if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  throw new Error("LINE credentials missing");
-}
+if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) throw new Error("LINE credentials missing");
 if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY missing");
 if (!GOOGLE_APPLICATION_CREDENTIALS_JSON) throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON missing");
 if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID missing");
 
 // ====== LINE / OpenAI ======
-const config = {
+const lineClient = new Client({
   channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: LINE_CHANNEL_SECRET,
-};
-const lineClient = new Client(config);
+});
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ====== Google Sheets auth ======
 function loadServiceAccount() {
   const creds = JSON.parse(GOOGLE_APPLICATION_CREDENTIALS_JSON);
-  // Renderなどで \n がエスケープされている場合に復元
   if (creds.private_key && creds.private_key.includes("\\n")) {
     creds.private_key = creds.private_key.replace(/\\n/g, "\n");
   }
@@ -105,7 +103,6 @@ async function ensureSheetExists(title) {
     }
   }
 }
-
 async function appendRow(title, values) {
   await ensureSheetExists(title);
   await sheets.spreadsheets.values.append({
@@ -148,20 +145,17 @@ async function getAllPairs(userId) {
   const rows = (res.data.values || []).slice(1);
   return rows
     .filter(r => r[1] === userId && r[5] === "SENT")
-    .map(r => ({ user: r[3] || "", asst: r[4] || "" })); // 古い→新しい（厳密に時刻で並べたい場合はA列でソート）
+    .map(r => ({ user: r[3] || "", asst: r[4] || "" })); // ※厳密に並べるならA列でソート追加
 }
-
 function formatRecentPairs(pairs, maxPairs = 20, charLimit = 2000) {
-  const last = pairs.slice(-maxPairs).reverse(); // 新しい→古い
+  const last = pairs.slice(-maxPairs).reverse(); // 新→古
   let out = last.map(p => `U: ${p.user}\nA: ${p.asst}`).join("\n---\n");
   if (out.length > charLimit) out = out.slice(-charLimit);
   return out;
 }
-
 function takeOlderForSummary(pairs, recentCount = 20) {
   return pairs.slice(0, Math.max(0, pairs.length - recentCount));
 }
-
 async function getLongSummary(userId) {
   await ensureSheetExists(SUMMARIES_SHEET);
   const res = await sheets.spreadsheets.values.get({
@@ -172,7 +166,6 @@ async function getLongSummary(userId) {
   const hit = rows.find(r => r[0] === userId);
   return hit ? (hit[1] || "") : "";
 }
-
 async function upsertLongSummary(userId, summary) {
   await ensureSheetExists(SUMMARIES_SHEET);
   const res = await sheets.spreadsheets.values.get({
@@ -194,7 +187,6 @@ async function upsertLongSummary(userId, summary) {
     });
   }
 }
-
 async function summarizePairs(olderPairs) {
   if (!olderPairs.length) return "";
   const corpus = olderPairs.map(p => `U: ${p.user}\nA: ${p.asst}`).join("\n---\n");
@@ -218,7 +210,6 @@ ${corpus}
   });
   return r.choices?.[0]?.message?.content?.trim() || "";
 }
-
 async function buildUserContext(userId) {
   const allPairs = await getAllPairs(userId);
   let recentStr = formatRecentPairs(allPairs, 20, 2000);
@@ -243,25 +234,17 @@ async function buildUserContext(userId) {
 async function readApprovedLogRows() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${qTitle(SHEET_NAME)}!A:G`, // [timestamp, userId, displayName, userText, draft, status, rowId]
+    range: `${qTitle(SHEET_NAME)}!A:G`,
   });
   const rows = (res.data.values || []).slice(1);
   return rows.filter(r => r[3] && r[4] && r[5] === "SENT");
 }
-
 function keywordOverlapScore(a = "", b = "") {
-  const tokenize = s =>
-    String(s)
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .split(/\s+/)
-      .filter(Boolean);
+  const tokenize = s => String(s).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
   const A = new Set(tokenize(a)), B = new Set(tokenize(b));
-  let hit = 0;
-  A.forEach(t => { if (B.has(t)) hit++; });
+  let hit = 0; A.forEach(t => { if (B.has(t)) hit++; });
   return hit;
 }
-
 async function retrieveSimilarFromLogs(userText, k = 3) {
   try {
     const rows = await readApprovedLogRows();
@@ -271,7 +254,6 @@ async function retrieveSimilarFromLogs(userText, k = 3) {
       .sort((a, b) => b.score - a.score)
       .slice(0, k)
       .map(x => x.row);
-
     return ranked.map((r, i) => {
       const who = r[2] ? `（${r[2]}さん）` : "";
       return `【事例${i + 1}${who}】\nユーザー: ${r[3]}\n返答: ${r[4]}`;
@@ -335,30 +317,36 @@ async function updateStatus(rowIndex, status) {
   });
 }
 
-// ====== App ======
-const app = express();
+// ====== 連投まとめ（デバウンス） ======
+const WINDOW_SEC = parseInt(BATCH_WINDOW_SECONDS || "60", 10);
+// userId -> { texts: string[], timer: NodeJS.Timeout | null }
+const buffers = new Map();
 
-// Webhook：受信→下書き生成→シートにPENDING（自動返信はしない）
-app.post("/callback", middleware(config), async (req, res) => {
-  try {
-    for (const ev of (req.body.events || [])) {
-      await handleEvent(ev);
-    }
-    res.sendStatus(200);
-  } catch (e) {
-    console.error("webhook error:", e);
-    res.sendStatus(500);
-  }
-});
-
-async function handleEvent(event) {
+async function bufferIncoming(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
   const userId = event.source?.userId;
   if (!userId) return;
 
-  const userText = event.message.text;
+  const buf = buffers.get(userId) || { texts: [], timer: null };
+  buf.texts.push(event.message.text);
 
-  // プロフィール取得＆台帳更新
+  if (buf.timer) clearTimeout(buf.timer);
+
+  buf.timer = setTimeout(async () => {
+    const texts = buf.texts.slice();
+    buffers.delete(userId);
+    try {
+      await processBatchedMessages(userId, texts);
+    } catch (e) {
+      console.error("processBatchedMessages error:", e?.message || e);
+    }
+  }, WINDOW_SEC * 1000);
+
+  buffers.set(userId, buf);
+}
+
+async function processBatchedMessages(userId, texts) {
+  // プロフィール & 台帳
   let displayName = "";
   try {
     const prof = await lineClient.getProfile(userId);
@@ -366,22 +354,27 @@ async function handleEvent(event) {
   } catch {}
   await upsertUser(userId, displayName);
 
+  // ユーザー入力を結合（見やすい区切り線）
+  const userText = texts.join("\n——\n");
+
   // 下書き生成（文脈＋RAG）
   const draft = await generateDraftWithContext(userId, userText);
 
-  // シートに保存（PENDING）
+  // シート保存（PENDING）
   const rowId = genId();
   await appendRow(SHEET_NAME, [nowJST(), userId, displayName, userText, draft, "PENDING", rowId]);
 
-  // 管理者に承認リンク通知（任意）
+  // 管理者通知（任意）
   if (ADMIN_USER_ID && APPROVE_TOKEN && BASE_URL) {
     const reviewUrl = `${BASE_URL}/review?id=${rowId}&token=${APPROVE_TOKEN}`;
     try {
       await lineClient.pushMessage(ADMIN_USER_ID, {
         type: "text",
         text:
-          `【承認待ち】from ${displayName || "unknown"} (${userId})\n\n` +
-          `Q:\n${userText}\n\nDraft:\n${draft}\n\n` +
+          `【承認待ち（まとめ ${texts.length} 通）】\n` +
+          `from: ${displayName || "unknown"} (${userId})\n\n` +
+          `Q:\n${userText}\n\n` +
+          `Draft:\n${draft}\n\n` +
           `承認/却下 → ${reviewUrl}`,
       });
     } catch (e) {
@@ -389,6 +382,22 @@ async function handleEvent(event) {
     }
   }
 }
+
+// ====== App ======
+const app = express();
+
+// Webhook：受信→バッファへ（承認前はユーザーへ自動返信なし）
+app.post("/callback", middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }), async (req, res) => {
+  try {
+    for (const ev of (req.body.events || [])) {
+      await bufferIncoming(ev); // ★ここがポイント：即処理せずまとめる
+    }
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("webhook error:", e);
+    res.sendStatus(500);
+  }
+});
 
 // 承認レビューページ
 app.get("/review", async (req, res) => {
@@ -410,7 +419,7 @@ app.get("/review", async (req, res) => {
         <p><b>User:</b> ${escapeHtml(displayName)} (${escapeHtml(userId)})</p>
         <p><b>Time:</b> ${escapeHtml(ts)}</p>
         <hr>
-        <p><b>Message:</b><br>${escapeHtml(userText).replace(/\n/g,"<br>")}</p>
+        <p><b>Message (合算${escapeHtml(String((userText.match(/——/g)||[]).length+1))}通):</b><br>${escapeHtml(userText).replace(/\n/g,"<br>")}</p>
         <p><b>Draft:</b><br>${escapeHtml(draft).replace(/\n/g,"<br>")}</p>
         <p>
           <a href="${approveUrl}"><button style="padding:8px 16px;">承認して送信</button></a>
@@ -449,14 +458,13 @@ app.get("/approve", async (req, res) => {
   }
 });
 
-// 却下：ステータス更新のみ
+// 却下
 app.get("/reject", async (req, res) => {
   try {
     const { id, token } = req.query;
     if (!id || token !== APPROVE_TOKEN) return res.status(403).send("Forbidden");
     const found = await findRowById(String(id));
     if (!found) return res.status(404).send("Not found");
-
     await updateStatus(found.index, "REJECTED");
     res.send("却下しました。");
   } catch (e) {
@@ -466,9 +474,10 @@ app.get("/reject", async (req, res) => {
 });
 
 // Health
-app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (context + RAG + manual approval)"));
+app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (batch + context + RAG + manual approval)"));
 
-// ====== Start ======
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
+
 
