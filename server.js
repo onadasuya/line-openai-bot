@@ -1,4 +1,4 @@
-import express from "express";import express from "express";
+import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import OpenAI from "openai";
 import { google } from "googleapis";
@@ -479,5 +479,3 @@ app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (batch + context
 // Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
-
-
