@@ -21,6 +21,8 @@ const {
   BASE_URL,
   // 連投まとめ（秒）
   BATCH_WINDOW_SECONDS = "60",
+  // ★ 追加: 初回即時通知のクールダウン（秒）…推奨900=15分
+  QUICK_NOTIFY_COOLDOWN_SEC = "900",
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) throw new Error("LINE credentials missing");
@@ -319,16 +321,43 @@ async function updateStatus(rowIndex, status) {
 
 // ====== 連投まとめ（デバウンス） ======
 const WINDOW_SEC = parseInt(BATCH_WINDOW_SECONDS || "60", 10);
+// ★ 追加: 即時通知のクールダウン秒数
+const QUICK_COOLDOWN = parseInt(QUICK_NOTIFY_COOLDOWN_SEC || "900", 10);
+
 // userId -> { texts: string[], timer: NodeJS.Timeout | null }
 const buffers = new Map();
+// ★ 追加: userId -> 最後に“即時受信通知”を出した時刻(ms)
+const lastNotifiedAt = new Map();
 
 async function bufferIncoming(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
   const userId = event.source?.userId;
   if (!userId) return;
 
+  const text = event.message.text;
+
+  // ★ ここで“初回即時通知”を送る（直近QUICK_COOLDOWN以内は抑制）
+  if (ADMIN_USER_ID) {
+    const now = Date.now();
+    const last = lastNotifiedAt.get(userId) || 0;
+    if (now - last > QUICK_COOLDOWN * 1000) {
+      try {
+        await lineClient.pushMessage(ADMIN_USER_ID, {
+          type: "text",
+          text:
+            `【受信】${userId}\n「${text.slice(0, 100)}」\n` +
+            `（下書きは${WINDOW_SEC}秒後に作成／連投はまとめます）`,
+        });
+        lastNotifiedAt.set(userId, now);
+      } catch (e) {
+        console.error("admin quick notify error:", e?.message || e);
+      }
+    }
+  }
+
+  // 以降は既存のまとめ処理
   const buf = buffers.get(userId) || { texts: [], timer: null };
-  buf.texts.push(event.message.text);
+  buf.texts.push(text);
 
   if (buf.timer) clearTimeout(buf.timer);
 
@@ -364,7 +393,7 @@ async function processBatchedMessages(userId, texts) {
   const rowId = genId();
   await appendRow(SHEET_NAME, [nowJST(), userId, displayName, userText, draft, "PENDING", rowId]);
 
-  // 管理者通知（任意）
+  // 管理者通知（承認用）
   if (ADMIN_USER_ID && APPROVE_TOKEN && BASE_URL) {
     const reviewUrl = `${BASE_URL}/review?id=${rowId}&token=${APPROVE_TOKEN}`;
     try {
@@ -390,7 +419,7 @@ const app = express();
 app.post("/callback", middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }), async (req, res) => {
   try {
     for (const ev of (req.body.events || [])) {
-      await bufferIncoming(ev); // ★ここがポイント：即処理せずまとめる
+      await bufferIncoming(ev); // ★ここがポイント：即時受信通知 + まとめ処理
     }
     res.sendStatus(200);
   } catch (e) {
@@ -474,7 +503,7 @@ app.get("/reject", async (req, res) => {
 });
 
 // Health
-app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (batch + context + RAG + manual approval)"));
+app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (batch + context + RAG + manual approval + quick notify)"));
 
 // Start
 const PORT = process.env.PORT || 3000;
