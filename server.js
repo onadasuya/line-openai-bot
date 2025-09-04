@@ -4,7 +4,7 @@ import OpenAI from "openai";
 import { google } from "googleapis";
 import crypto from "crypto";
 
-/* ===================== ENV ===================== */
+// ====== ENV ======
 const {
   LINE_CHANNEL_ACCESS_TOKEN,
   LINE_CHANNEL_SECRET,
@@ -15,19 +15,12 @@ const {
   USERS_SHEET = "users",
   SUMMARIES_SHEET = "user_summaries",
   SYSTEM_PROMPT,
-
   // 手動承認（任意）
   ADMIN_USER_ID,
   APPROVE_TOKEN,
   BASE_URL,
-
   // 連投まとめ（秒）
   BATCH_WINDOW_SECONDS = "60",
-
-  // ★ 即時受信通知（1通目無音対策）トグル＆クールダウン
-  //   ENABLE_QUICK_NOTIFY = "1" で有効、未設定/0で無効
-  ENABLE_QUICK_NOTIFY,
-  QUICK_NOTIFY_COOLDOWN_SEC = "900", // 推奨 900 (=15分)
 } = process.env;
 
 if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) throw new Error("LINE credentials missing");
@@ -35,14 +28,14 @@ if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY missing");
 if (!GOOGLE_APPLICATION_CREDENTIALS_JSON) throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON missing");
 if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID missing");
 
-/* ===================== Clients ===================== */
+// ====== LINE / OpenAI ======
 const lineClient = new Client({
   channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: LINE_CHANNEL_SECRET,
 });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-/* ========== Google Sheets auth ========== */
+// ====== Google Sheets auth ======
 function loadServiceAccount() {
   const creds = JSON.parse(GOOGLE_APPLICATION_CREDENTIALS_JSON);
   if (creds.private_key && creds.private_key.includes("\\n")) {
@@ -59,7 +52,7 @@ const auth = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth });
 
-/* ===================== Utils ===================== */
+// ====== Utils ======
 function nowJST() {
   const now = new Date();
   return new Date(now.getTime() + 9 * 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19);
@@ -74,7 +67,7 @@ function escapeHtml(str = "") {
   return String(str).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-/* ========== Sheets: 作成 & 追記 ========== */
+// ====== シート作成＆書き込み ======
 async function ensureSheetExists(title) {
   try {
     await sheets.spreadsheets.values.get({
@@ -120,7 +113,7 @@ async function appendRow(title, values) {
   });
 }
 
-/* ========== Users 台帳 ========== */
+// ====== ユーザー台帳 ======
 async function upsertUser(userId, displayName) {
   await ensureSheetExists(USERS_SHEET);
   const res = await sheets.spreadsheets.values.get({
@@ -143,7 +136,7 @@ async function upsertUser(userId, displayName) {
   }
 }
 
-/* ========== 履歴・要約（最新20＋古い要約） ========== */
+// ====== 履歴・要約（最新20＋古い要約） ======
 async function getAllPairs(userId) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -152,7 +145,7 @@ async function getAllPairs(userId) {
   const rows = (res.data.values || []).slice(1);
   return rows
     .filter(r => r[1] === userId && r[5] === "SENT")
-    .map(r => ({ user: r[3] || "", asst: r[4] || "" }));
+    .map(r => ({ user: r[3] || "", asst: r[4] || "" })); // ※厳密に並べるならA列でソート追加
 }
 function formatRecentPairs(pairs, maxPairs = 20, charLimit = 2000) {
   const last = pairs.slice(-maxPairs).reverse(); // 新→古
@@ -237,7 +230,7 @@ async function buildUserContext(userId) {
   return { longSummary, recentStr };
 }
 
-/* ========== RAG：承認済みログから似た事例を参照 ========== */
+// ====== RAG：承認済みログから似た事例を参照 ======
 async function readApprovedLogRows() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -271,7 +264,7 @@ async function retrieveSimilarFromLogs(userText, k = 3) {
   }
 }
 
-/* ========== Draft 生成（親友スタイル＋文脈＋参考事例） ========== */
+// ====== Draft 生成（親友スタイル＋文脈＋参考事例） ======
 async function generateDraftWithContext(userId, userText) {
   const { longSummary, recentStr } = await buildUserContext(userId);
   const similarCases = await retrieveSimilarFromLogs(userText, 3);
@@ -303,7 +296,7 @@ NG：説教・断定・価値判断・絵文字乱用。
   return r.choices?.[0]?.message?.content?.trim() || "うまく返せなかった…もう一度教えてほしい。";
 }
 
-/* ========== 行検索／ステータス更新 ========== */
+// ====== 便利: rowId検索/ステータス更新 ======
 async function findRowById(rowId) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -324,51 +317,18 @@ async function updateStatus(rowIndex, status) {
   });
 }
 
-/* ========== 連投まとめ（デバウンス） ========== */
+// ====== 連投まとめ（デバウンス） ======
 const WINDOW_SEC = parseInt(BATCH_WINDOW_SECONDS || "60", 10);
-
-// 即時受信通知の設定
-const QUICK_COOLDOWN = parseInt(QUICK_NOTIFY_COOLDOWN_SEC || "900", 10);
-const USE_QUICK_NOTIFY = (ENABLE_QUICK_NOTIFY === "1");
-
 // userId -> { texts: string[], timer: NodeJS.Timeout | null }
 const buffers = new Map();
-// userId -> 最後に“即時受信通知”を出した時刻(ms)
-const lastNotifiedAt = new Map();
 
 async function bufferIncoming(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
   const userId = event.source?.userId;
   if (!userId) return;
 
-  const text = event.message.text;
-
-  // ★ 初回即時通知（トグル ON の時のみ）
-  if (USE_QUICK_NOTIFY && ADMIN_USER_ID) {
-    const now = Date.now();
-    const last = lastNotifiedAt.get(userId) || 0;
-    const diff = now - last;
-    console.log("[QUICK] user", userId, { diff, cooldown_ms: QUICK_COOLDOWN * 1000 });
-
-    if (diff > QUICK_COOLDOWN * 1000) {
-      try {
-        await lineClient.pushMessage(ADMIN_USER_ID, {
-          type: "text",
-          text:
-            `【受信】${userId}\n「${text.slice(0, 100)}」\n` +
-            `（下書きは${WINDOW_SEC}秒後に作成／連投はまとめます）`,
-        });
-        lastNotifiedAt.set(userId, now);
-      } catch (e) {
-        console.error("admin quick notify error:",
-          e?.statusCode, e?.code, e?.message, e?.originalError?.response?.data);
-      }
-    }
-  }
-
-  // 以降：まとめ処理
   const buf = buffers.get(userId) || { texts: [], timer: null };
-  buf.texts.push(text);
+  buf.texts.push(event.message.text);
 
   if (buf.timer) clearTimeout(buf.timer);
 
@@ -376,7 +336,6 @@ async function bufferIncoming(event) {
     const texts = buf.texts.slice();
     buffers.delete(userId);
     try {
-      console.log("[BATCH] flush", userId, "count", texts.length);
       await processBatchedMessages(userId, texts);
     } catch (e) {
       console.error("processBatchedMessages error:", e?.message || e);
@@ -405,7 +364,7 @@ async function processBatchedMessages(userId, texts) {
   const rowId = genId();
   await appendRow(SHEET_NAME, [nowJST(), userId, displayName, userText, draft, "PENDING", rowId]);
 
-  // 管理者通知（承認用）
+  // 管理者通知（任意）
   if (ADMIN_USER_ID && APPROVE_TOKEN && BASE_URL) {
     const reviewUrl = `${BASE_URL}/review?id=${rowId}&token=${APPROVE_TOKEN}`;
     try {
@@ -419,32 +378,26 @@ async function processBatchedMessages(userId, texts) {
           `承認/却下 → ${reviewUrl}`,
       });
     } catch (e) {
-      console.error("admin notify error:", e?.statusCode, e?.code, e?.message, e?.originalError?.response?.data);
+      console.error("admin notify error:", e?.message || e);
     }
-  } else {
-    console.log("[NOTICE] admin notify skipped (ADMIN_USER_ID/APPROVE_TOKEN/BASE_URL missing)");
   }
 }
 
-/* ===================== App ===================== */
+// ====== App ======
 const app = express();
 
-// Webhook：受信→バッファ（ユーザーへ即返信はしない／承認制）
-app.post(
-  "/callback",
-  middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }),
-  async (req, res) => {
-    try {
-      for (const ev of (req.body.events || [])) {
-        await bufferIncoming(ev);
-      }
-      res.sendStatus(200);
-    } catch (e) {
-      console.error("webhook error:", e);
-      res.sendStatus(500);
+// Webhook：受信→バッファへ（承認前はユーザーへ自動返信なし）
+app.post("/callback", middleware({ channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET }), async (req, res) => {
+  try {
+    for (const ev of (req.body.events || [])) {
+      await bufferIncoming(ev); // ★ここがポイント：即処理せずまとめる
     }
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("webhook error:", e);
+    res.sendStatus(500);
   }
-);
+});
 
 // 承認レビューページ
 app.get("/review", async (req, res) => {
@@ -520,38 +473,9 @@ app.get("/reject", async (req, res) => {
   }
 });
 
-/* ======== 診断ルート（便利） ======== */
-// 環境値チェック
-app.get("/diag/env", (req, res) => {
-  res.json({
-    ENABLE_QUICK_NOTIFY,
-    QUICK_NOTIFY_COOLDOWN_SEC,
-    BATCH_WINDOW_SECONDS: process.env.BATCH_WINDOW_SECONDS,
-    ADMIN_USER_ID_set: !!process.env.ADMIN_USER_ID,
-    BASE_URL_set: !!process.env.BASE_URL,
-    APPROVE_TOKEN_set: !!process.env.APPROVE_TOKEN,
-    SHEET_NAME,
-  });
-});
+// Health
+app.get("/", (_, res) => res.send("LINE × OpenAI × Sheets bot (batch + context + RAG + manual approval)"));
 
-// 管理者へのpushテスト
-app.get("/diag/push", async (req, res) => {
-  try {
-    if (!ADMIN_USER_ID) return res.status(400).send("ADMIN_USER_ID not set");
-    await lineClient.pushMessage(ADMIN_USER_ID, { type: "text", text: "テスト通知（サーバー→管理者）は送れます" });
-    res.send("ok");
-  } catch (e) {
-    console.error("diag push err:",
-      e?.statusCode, e?.code, e?.message, e?.originalError?.response?.data);
-    res.status(500).send("push failed (see logs)");
-  }
-});
-
-/* ===================== Health ===================== */
-app.get("/", (_, res) =>
-  res.send("LINE × OpenAI × Sheets bot (batch + context + RAG + manual approval + quick notify toggle)")
-);
-
-/* ===================== Start ===================== */
+// Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
